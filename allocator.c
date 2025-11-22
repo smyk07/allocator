@@ -1,28 +1,73 @@
 #include "allocator.h"
 
 #include <pthread.h>
-#include <stddef.h>
+#include <stdint.h>
 #include <string.h>
-#include <unistd.h>
+#include <sys/mman.h>
 
-typedef char ALIGN[16];
+/*
+ * @typedef ALIGN
+ * @brief Allignment type for ensuring proper memory allignment.
+ */
+typedef char ALIGN[sizeof(max_align_t)];
 
-typedef union header header_t;
-
-union header {
+/*
+ * @union header_t
+ * @brief memory block metadata header with allignment.
+ *
+ * Each block of memory is preceeded by this header, which tracks size,
+ * allocation status, and links to succeeding blocks.
+ *
+ * Structure:
+ *
+ *    +--------------+------------------------+
+ *    | header_t     | memory block           |
+ *    +--------------+------------------------+
+ *
+ *    ^              ^
+ *    |              |
+ *    start          returned ptr
+ */
+typedef union header {
   struct {
+    /* Size of the allocated memory block in bytes excluding the header */
     size_t size;
+
+    /* Free status flag */
     unsigned is_free;
+
+    /* Pointer to the next block in the free list */
     union header *next;
+
+    /* Pointer to the next block in the allocation tracking list */
+    union header *next_alloc;
   } s;
   ALIGN stub;
-};
+} header_t;
 
-pthread_mutex_t global_malloc_lock;
+/*
+ *  Global mutex for access to allocator data structures
+ */
+static pthread_mutex_t global_malloc_lock = PTHREAD_MUTEX_INITIALIZER;
 
+/*
+ * Head of the allocation tracking list for automatic cleanup
+ */
+static header_t *alloc_list_head = NULL;
+
+/*
+ * Head and tail of the main memory block linked list
+ */
 static header_t *head;
 static header_t *tail;
 
+/*
+ * @brief Searches the free list for a block large enough for the given size
+ *
+ * @param size Minimum size required in bytes
+ *
+ * @return Pointer to a suitable free block, or NULL
+ */
 static header_t *get_free_block(size_t size) {
   header_t *curr = head;
   while (curr) {
@@ -41,22 +86,37 @@ void *malloc_a(size_t size) {
   if (!size)
     return NULL;
 
+  if (size > SIZE_MAX - sizeof(max_align_t) + 1) {
+    return NULL;
+  }
+
+  size_t aligned_size =
+      (size + sizeof(max_align_t) - 1) & ~(sizeof(max_align_t) - 1);
+
+  if (aligned_size > SIZE_MAX - sizeof(header_t)) {
+    return NULL;
+  }
+
   pthread_mutex_lock(&global_malloc_lock);
-  header = get_free_block(size);
+  header = get_free_block(aligned_size);
   if (header) {
     header->s.is_free = 0;
     pthread_mutex_unlock(&global_malloc_lock);
     return (void *)(header + 1);
   }
 
-  total_size = sizeof(header_t) + size;
-  block = sbrk(total_size);
-  if (block == (void *)-1) {
+  total_size = sizeof(header_t) + aligned_size;
+
+  block = mmap(NULL, total_size, PROT_READ | PROT_WRITE,
+               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+
+  if (block == MAP_FAILED) {
     pthread_mutex_unlock(&global_malloc_lock);
     return NULL;
   }
+
   header = block;
-  header->s.size = size;
+  header->s.size = aligned_size;
   header->s.is_free = 0;
   header->s.next = NULL;
 
@@ -66,43 +126,119 @@ void *malloc_a(size_t size) {
     tail->s.next = header;
   tail = header;
 
+  header->s.next_alloc = alloc_list_head;
+  alloc_list_head = header;
+
   pthread_mutex_unlock(&global_malloc_lock);
 
   return (void *)(header + 1);
 }
 
 void free_a(void *block) {
-  header_t *header, *tmp;
-  void *programbreak;
+  header_t *header, *tmp, *prev = NULL;
 
   if (!block)
     return;
+
   pthread_mutex_lock(&global_malloc_lock);
   header = (header_t *)block - 1;
 
-  programbreak = sbrk(0);
-  if ((char *)block + header->s.size == programbreak) {
-    if (head == tail) {
-      head = tail = NULL;
-    } else {
-      tmp = head;
-      while (tmp) {
-        if (tmp->s.next == tail) {
-          tmp->s.next = NULL;
-          tail = tmp;
-        }
-        tmp = tmp->s.next;
+  tmp = alloc_list_head;
+  prev = NULL;
+  while (tmp) {
+    if (tmp == header) {
+      if (prev) {
+        prev->s.next_alloc = tmp->s.next_alloc;
+      } else {
+        alloc_list_head = tmp->s.next_alloc;
       }
+      break;
     }
-    sbrk(0 - sizeof(header_t) - header->s.size);
+    prev = tmp;
+    tmp = tmp->s.next_alloc;
+  }
+
+  if (head == tail && header == head) {
+    size_t total_size = sizeof(header_t) + header->s.size;
+    munmap(header, total_size);
+    head = tail = NULL;
     pthread_mutex_unlock(&global_malloc_lock);
     return;
   }
+
   header->s.is_free = 1;
+
+  tmp = header->s.next;
+  while (tmp && tmp->s.is_free) {
+    header_t *alloc_curr = alloc_list_head;
+    header_t *alloc_prev = NULL;
+    while (alloc_curr) {
+      if (alloc_curr == tmp) {
+        if (alloc_prev) {
+          alloc_prev->s.next_alloc = alloc_curr->s.next_alloc;
+        } else {
+          alloc_list_head = alloc_curr->s.next_alloc;
+        }
+        break;
+      }
+      alloc_prev = alloc_curr;
+      alloc_curr = alloc_curr->s.next_alloc;
+    }
+
+    header->s.size += sizeof(header_t) + tmp->s.size;
+    header->s.next = tmp->s.next;
+
+    if (tmp == tail) {
+      tail = header;
+    }
+    tmp = header->s.next;
+  }
+
   pthread_mutex_unlock(&global_malloc_lock);
 }
 
-void *calloc(size_t num, size_t nsize) {
+/*
+ * @brief: Frees all remaining allocated memory blocks at program exit
+ */
+static void cleanup_a(void) {
+  pthread_mutex_lock(&global_malloc_lock);
+
+  header_t *curr = alloc_list_head;
+
+  while (curr) {
+    header_t *next = curr->s.next_alloc;
+    if (!curr->s.is_free) {
+      pthread_mutex_unlock(&global_malloc_lock);
+      free_a((void *)(curr + 1));
+      pthread_mutex_lock(&global_malloc_lock);
+    }
+    curr = next;
+  }
+
+  pthread_mutex_unlock(&global_malloc_lock);
+}
+
+/*
+ * Manual declaration of the standard library atexit() function to avoid
+ * including <stdlib.h>. The extern "C" guards ensure proper C linkage
+ * when this header is included from C++ source files.
+ */
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+extern int atexit(void (*func)(void));
+
+#ifdef __cplusplus
+}
+#endif
+
+/*
+ * @brief Initializer function that registers cleanup at program start
+ */
+__attribute__((constructor)) void init_a(void) { atexit(cleanup_a); }
+
+void *calloc_a(size_t num, size_t nsize) {
   size_t size;
   void *block;
 
@@ -126,8 +262,12 @@ void *realloc_a(void *block, size_t size) {
   header_t *header;
   void *ret;
 
-  if (!block || !size)
+  if (!block)
     return malloc_a(size);
+  if (!size) {
+    free_a(block);
+    return NULL;
+  }
 
   header = (header_t *)block - 1;
   if (header->s.size >= size)
