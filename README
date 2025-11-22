@@ -1,0 +1,7 @@
+Allocator
+
+My own allocator implementation in C.
+
+Agendas:
+- Implement tracking
+- Implement cleanup function so no free calls are required by the user
