@@ -143,6 +143,63 @@ void test_multithreaded(void) {
   printf("multithreaded test complete\n");
 }
 
+#define FREE_TEST_THREADS 8
+#define ALLOCS_PER_THREAD 50
+
+void *free_test_thread_func(void *arg) {
+  int thread_id = *(int *)arg;
+  void *allocations[ALLOCS_PER_THREAD];
+
+  for (int i = 0; i < ALLOCS_PER_THREAD; i++) {
+    size_t size = (i + 1) * 16; // Varying sizes
+    allocations[i] = malloc_a(size);
+    if (!allocations[i]) {
+      printf("Thread %d: allocation %d failed\n", thread_id, i);
+      for (int j = 0; j < i; j++) {
+        free_a(allocations[j]);
+      }
+      return NULL;
+    }
+    memset(allocations[i], thread_id, size);
+  }
+
+  printf("Thread %d: allocated %d blocks\n", thread_id, ALLOCS_PER_THREAD);
+
+  for (int i = 0; i < ALLOCS_PER_THREAD; i += 2) {
+    free_a(allocations[i]);
+  }
+
+  for (int i = 1; i < ALLOCS_PER_THREAD; i += 2) {
+    free_a(allocations[i]);
+  }
+
+  printf("Thread %d: freed all %d blocks\n", thread_id, ALLOCS_PER_THREAD);
+
+  return NULL;
+}
+
+void test_multithreaded_free(void) {
+  pthread_t threads[FREE_TEST_THREADS];
+  int thread_ids[FREE_TEST_THREADS];
+
+  printf("Starting multithreaded free test with %d threads (%d allocs each)\n",
+         FREE_TEST_THREADS, ALLOCS_PER_THREAD);
+
+  for (int i = 0; i < FREE_TEST_THREADS; ++i) {
+    thread_ids[i] = i + 1;
+    if (pthread_create(&threads[i], NULL, free_test_thread_func,
+                       &thread_ids[i]) != 0) {
+      printf("Failed to create thread %d\n", i + 1);
+    }
+  }
+
+  for (int i = 0; i < FREE_TEST_THREADS; ++i) {
+    pthread_join(threads[i], NULL);
+  }
+
+  printf("multithreaded free test complete\n");
+}
+
 #define elapsed_ms(start, end)                                                 \
   (end.tv_sec - start.tv_sec) * 1000.0 +                                       \
       (end.tv_nsec - start.tv_nsec) / 1000000.0
@@ -169,6 +226,11 @@ int main() {
   test_multithreaded();
   clock_gettime(CLOCK_MONOTONIC, &end);
   printf("test_multithreaded took %.3f ms\n\n", elapsed_ms(start, end));
+
+  clock_gettime(CLOCK_MONOTONIC, &start);
+  test_multithreaded_free();
+  clock_gettime(CLOCK_MONOTONIC, &end);
+  printf("test_multithreaded_free took %.3f ms\n\n", elapsed_ms(start, end));
 
   return 0;
 }
