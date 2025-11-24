@@ -3,3 +3,10 @@ Allocator
 My own allocator implementation in C with automatic cleanup.
 
 Inspiration: https://arjunsreedharan.org/post/148675821737/memory-allocators-101-write-a-simple-memory
+
+Agenda: 
+- Improve performance, O(1) time complexity for malloc. Needs research though
+  - Bitmap?
+- Make sure malloc never returns null, or allow for a safe exit
+- Compile time optimizations for all functions - inlining, __builtin_expect and hot functions
+- Avoid global lock
