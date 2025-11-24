@@ -144,7 +144,6 @@ void free_a(void *block) {
   header = (header_t *)block - 1;
 
   tmp = alloc_list_head;
-  prev = NULL;
   while (tmp) {
     if (tmp == header) {
       if (prev) {
@@ -158,40 +157,18 @@ void free_a(void *block) {
     tmp = tmp->s.next_alloc;
   }
 
-  if (head == tail && header == head) {
-    size_t total_size = sizeof(header_t) + header->s.size;
-    munmap(header, total_size);
-    head = tail = NULL;
-    pthread_mutex_unlock(&global_malloc_lock);
-    return;
-  }
-
   header->s.is_free = 1;
 
   tmp = header->s.next;
   while (tmp && tmp->s.is_free) {
-    header_t *alloc_curr = alloc_list_head;
-    header_t *alloc_prev = NULL;
-    while (alloc_curr) {
-      if (alloc_curr == tmp) {
-        if (alloc_prev) {
-          alloc_prev->s.next_alloc = alloc_curr->s.next_alloc;
-        } else {
-          alloc_list_head = alloc_curr->s.next_alloc;
-        }
-        break;
-      }
-      alloc_prev = alloc_curr;
-      alloc_curr = alloc_curr->s.next_alloc;
-    }
-
+    header_t *next_block = tmp->s.next;
     header->s.size += sizeof(header_t) + tmp->s.size;
-    header->s.next = tmp->s.next;
+    header->s.next = next_block;
 
     if (tmp == tail) {
       tail = header;
     }
-    tmp = header->s.next;
+    tmp = next_block;
   }
 
   pthread_mutex_unlock(&global_malloc_lock);
